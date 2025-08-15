@@ -12,6 +12,8 @@
 (define-constant ERR-INVALID-VERSION (err u1004))
 (define-constant ERR-NOT-SUBSCRIBED (err u1005))
 (define-constant ERR-INSUFFICIENT-PAYMENT (err u1006))
+(define-constant ERR-INVALID-RATING (err u1007))
+(define-constant ERR-ALREADY-REVIEWED (err u1008))
 
 (define-data-var next-textbook-id uint u1)
 (define-data-var subscription-price uint u1000000)
@@ -45,7 +47,15 @@
 (define-map textbook-stats uint {
   total-subscribers: uint,
   total-downloads: uint,
-  total-earnings: uint
+  total-earnings: uint,
+  total-reviews: uint,
+  average-rating: uint
+})
+
+(define-map textbook-reviews {textbook-id: uint, reviewer: principal} {
+  rating: uint,
+  review-text: (string-ascii 500),
+  created-at: uint
 })
 
 (define-public (create-textbook (title (string-ascii 256)) (description (string-ascii 512)) (initial-content-hash (string-ascii 64)) (price uint))
@@ -75,7 +85,9 @@
     (map-set textbook-stats textbook-id {
       total-subscribers: u0,
       total-downloads: u0,
-      total-earnings: u0
+      total-earnings: u0,
+      total-reviews: u0,
+      average-rating: u0
     })
     
     (var-set next-textbook-id (+ textbook-id u1))
@@ -279,5 +291,78 @@
       })
       none
     )
+  )
+)
+
+(define-public (submit-review (textbook-id uint) (rating uint) (review-text (string-ascii 500)))
+  (let 
+    (
+      (existing-review (map-get? textbook-reviews {textbook-id: textbook-id, reviewer: tx-sender}))
+      (subscription (unwrap! (map-get? student-subscriptions {student: tx-sender, textbook-id: textbook-id}) ERR-NOT-SUBSCRIBED))
+      (textbook-data (unwrap! (map-get? textbooks textbook-id) ERR-NOT-FOUND))
+      (current-stats (unwrap! (map-get? textbook-stats textbook-id) ERR-NOT-FOUND))
+      (current-total (get total-reviews current-stats))
+      (current-avg (get average-rating current-stats))
+      (new-total (+ current-total u1))
+      (new-avg (/ (+ (* current-avg current-total) rating) new-total))
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+    (asserts! (get active subscription) ERR-NOT-SUBSCRIBED)
+    (asserts! (is-none existing-review) ERR-ALREADY-REVIEWED)
+    
+    (map-set textbook-reviews {textbook-id: textbook-id, reviewer: tx-sender} {
+      rating: rating,
+      review-text: review-text,
+      created-at: stacks-block-height
+    })
+    
+    (map-set textbook-stats textbook-id 
+      (merge current-stats {
+        total-reviews: new-total,
+        average-rating: new-avg
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-public (update-review (textbook-id uint) (rating uint) (review-text (string-ascii 500)))
+  (let 
+    (
+      (existing-review (unwrap! (map-get? textbook-reviews {textbook-id: textbook-id, reviewer: tx-sender}) ERR-NOT-FOUND))
+      (subscription (unwrap! (map-get? student-subscriptions {student: tx-sender, textbook-id: textbook-id}) ERR-NOT-SUBSCRIBED))
+      (current-stats (unwrap! (map-get? textbook-stats textbook-id) ERR-NOT-FOUND))
+      (current-total (get total-reviews current-stats))
+      (current-avg (get average-rating current-stats))
+      (old-rating (get rating existing-review))
+      (new-avg (/ (+ (- (* current-avg current-total) old-rating) rating) current-total))
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+    (asserts! (get active subscription) ERR-NOT-SUBSCRIBED)
+    
+    (map-set textbook-reviews {textbook-id: textbook-id, reviewer: tx-sender} {
+      rating: rating,
+      review-text: review-text,
+      created-at: (get created-at existing-review)
+    })
+    
+    (map-set textbook-stats textbook-id 
+      (merge current-stats {average-rating: new-avg}))
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-textbook-review (textbook-id uint) (reviewer principal))
+  (map-get? textbook-reviews {textbook-id: textbook-id, reviewer: reviewer})
+)
+
+(define-read-only (get-textbook-rating (textbook-id uint))
+  (match (map-get? textbook-stats textbook-id)
+    stats (some {
+      average-rating: (get average-rating stats),
+      total-reviews: (get total-reviews stats)
+    })
+    none
   )
 )
