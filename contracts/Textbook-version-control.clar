@@ -14,6 +14,10 @@
 (define-constant ERR-INSUFFICIENT-PAYMENT (err u1006))
 (define-constant ERR-INVALID-RATING (err u1007))
 (define-constant ERR-ALREADY-REVIEWED (err u1008))
+(define-constant ERR-NOT-COAUTHOR (err u1009))
+(define-constant ERR-INVALID-PERCENTAGE (err u1010))
+(define-constant ERR-ALREADY-COAUTHOR (err u1011))
+(define-constant ERR-CANNOT-REMOVE-LEAD (err u1012))
 
 (define-data-var next-textbook-id uint u1)
 (define-data-var subscription-price uint u1000000)
@@ -58,6 +62,29 @@
   created-at: uint
 })
 
+(define-map textbook-coauthors {textbook-id: uint, coauthor: principal} {
+  contribution-percentage: uint,
+  role: (string-ascii 50),
+  can-publish-updates: bool,
+  added-at: uint,
+  total-earned: uint
+})
+
+(define-map textbook-collaboration-info uint {
+  total-coauthors: uint,
+  revenue-pool: uint,
+  last-distribution: uint,
+  collaboration-active: bool
+})
+
+(define-map coauthor-invites {textbook-id: uint, invitee: principal} {
+  contribution-percentage: uint,
+  role: (string-ascii 50),
+  can-publish-updates: bool,
+  invited-at: uint,
+  invited-by: principal
+})
+
 (define-public (create-textbook (title (string-ascii 256)) (description (string-ascii 512)) (initial-content-hash (string-ascii 64)) (price uint))
   (let 
     (
@@ -90,6 +117,21 @@
       average-rating: u0
     })
     
+    (map-set textbook-coauthors {textbook-id: textbook-id, coauthor: tx-sender} {
+      contribution-percentage: u10000,
+      role: "Lead Author",
+      can-publish-updates: true,
+      added-at: stacks-block-height,
+      total-earned: u0
+    })
+    
+    (map-set textbook-collaboration-info textbook-id {
+      total-coauthors: u1,
+      revenue-pool: u0,
+      last-distribution: stacks-block-height,
+      collaboration-active: false
+    })
+    
     (var-set next-textbook-id (+ textbook-id u1))
     (ok textbook-id)
   )
@@ -100,8 +142,15 @@
     (
       (textbook-data (unwrap! (map-get? textbooks textbook-id) ERR-NOT-FOUND))
       (new-version (+ (get current-version textbook-data) u1))
+      (coauthor-data (map-get? textbook-coauthors {textbook-id: textbook-id, coauthor: tx-sender}))
     )
-    (asserts! (is-eq (get author textbook-data) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (or 
+      (is-eq (get author textbook-data) tx-sender)
+      (match coauthor-data
+        coauthor (get can-publish-updates coauthor)
+        false
+      )
+    ) ERR-NOT-AUTHORIZED)
     (asserts! (get active textbook-data) ERR-NOT-FOUND)
     
     (map-set textbooks textbook-id 
@@ -124,11 +173,17 @@
       (textbook-data (unwrap! (map-get? textbooks textbook-id) ERR-NOT-FOUND))
       (payment-amount (get price textbook-data))
       (stats (unwrap! (map-get? textbook-stats textbook-id) ERR-NOT-FOUND))
+      (collab-info (map-get? textbook-collaboration-info textbook-id))
     )
     (asserts! (get active textbook-data) ERR-NOT-FOUND)
     (asserts! (>= (stx-get-balance tx-sender) payment-amount) ERR-INSUFFICIENT-PAYMENT)
     
-    (try! (stx-transfer? payment-amount tx-sender (get author textbook-data)))
+    (if (match collab-info
+          info (get collaboration-active info)
+          false)
+      (try! (stx-transfer? payment-amount tx-sender (as-contract tx-sender)))
+      (try! (stx-transfer? payment-amount tx-sender (get author textbook-data)))
+    )
     
     (map-set student-subscriptions {student: tx-sender, textbook-id: textbook-id} {
       subscribed-at: stacks-block-height,
@@ -143,8 +198,16 @@
         total-earnings: (+ (get total-earnings stats) payment-amount)
       }))
     
-    (map-set author-earnings (get author textbook-data)
-      (+ (default-to u0 (map-get? author-earnings (get author textbook-data))) payment-amount))
+    (match collab-info
+      info (if (get collaboration-active info)
+        (map-set textbook-collaboration-info textbook-id
+          (merge info {revenue-pool: (+ (get revenue-pool info) payment-amount)}))
+        (map-set author-earnings (get author textbook-data)
+          (+ (default-to u0 (map-get? author-earnings (get author textbook-data))) payment-amount))
+      )
+      (map-set author-earnings (get author textbook-data)
+        (+ (default-to u0 (map-get? author-earnings (get author textbook-data))) payment-amount))
+    )
     
     (ok true)
   )
@@ -365,4 +428,155 @@
     })
     none
   )
+)
+
+(define-public (invite-coauthor (textbook-id uint) (coauthor principal) (contribution-percentage uint) (role (string-ascii 50)) (can-publish bool))
+  (let
+    (
+      (textbook-data (unwrap! (map-get? textbooks textbook-id) ERR-NOT-FOUND))
+      (existing-coauthor (map-get? textbook-coauthors {textbook-id: textbook-id, coauthor: coauthor}))
+      (existing-invite (map-get? coauthor-invites {textbook-id: textbook-id, invitee: coauthor}))
+    )
+    (asserts! (is-eq (get author textbook-data) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none existing-coauthor) ERR-ALREADY-COAUTHOR)
+    (asserts! (and (> contribution-percentage u0) (<= contribution-percentage u10000)) ERR-INVALID-PERCENTAGE)
+    
+    (map-set coauthor-invites {textbook-id: textbook-id, invitee: coauthor} {
+      contribution-percentage: contribution-percentage,
+      role: role,
+      can-publish-updates: can-publish,
+      invited-at: stacks-block-height,
+      invited-by: tx-sender
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (accept-coauthor-invite (textbook-id uint))
+  (let
+    (
+      (invite (unwrap! (map-get? coauthor-invites {textbook-id: textbook-id, invitee: tx-sender}) ERR-NOT-FOUND))
+      (collab-info (unwrap! (map-get? textbook-collaboration-info textbook-id) ERR-NOT-FOUND))
+    )
+    
+    (map-set textbook-coauthors {textbook-id: textbook-id, coauthor: tx-sender} {
+      contribution-percentage: (get contribution-percentage invite),
+      role: (get role invite),
+      can-publish-updates: (get can-publish-updates invite),
+      added-at: stacks-block-height,
+      total-earned: u0
+    })
+    
+    (map-set textbook-collaboration-info textbook-id
+      (merge collab-info {
+        total-coauthors: (+ (get total-coauthors collab-info) u1),
+        collaboration-active: true
+      }))
+    
+    (map-delete coauthor-invites {textbook-id: textbook-id, invitee: tx-sender})
+    
+    (ok true)
+  )
+)
+
+(define-public (distribute-revenue (textbook-id uint))
+  (let
+    (
+      (textbook-data (unwrap! (map-get? textbooks textbook-id) ERR-NOT-FOUND))
+      (collab-info (unwrap! (map-get? textbook-collaboration-info textbook-id) ERR-NOT-FOUND))
+      (revenue-pool (get revenue-pool collab-info))
+    )
+    (asserts! (is-eq (get author textbook-data) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (get collaboration-active collab-info) ERR-NOT-FOUND)
+    (asserts! (> revenue-pool u0) ERR-INSUFFICIENT-PAYMENT)
+    
+    (map-set textbook-collaboration-info textbook-id
+      (merge collab-info {
+        revenue-pool: u0,
+        last-distribution: stacks-block-height
+      }))
+    
+    (ok revenue-pool)
+  )
+)
+
+(define-public (claim-coauthor-revenue (textbook-id uint))
+  (let
+    (
+      (coauthor-data (unwrap! (map-get? textbook-coauthors {textbook-id: textbook-id, coauthor: tx-sender}) ERR-NOT-COAUTHOR))
+      (collab-info (unwrap! (map-get? textbook-collaboration-info textbook-id) ERR-NOT-FOUND))
+      (last-distribution (get last-distribution collab-info))
+      (revenue-pool (get revenue-pool collab-info))
+      (share-amount (/ (* revenue-pool (get contribution-percentage coauthor-data)) u10000))
+    )
+    (asserts! (> share-amount u0) ERR-INSUFFICIENT-PAYMENT)
+    
+    (try! (as-contract (stx-transfer? share-amount tx-sender tx-sender)))
+    
+    (map-set textbook-coauthors {textbook-id: textbook-id, coauthor: tx-sender}
+      (merge coauthor-data {
+        total-earned: (+ (get total-earned coauthor-data) share-amount)
+      }))
+    
+    (map-set textbook-collaboration-info textbook-id
+      (merge collab-info {
+        revenue-pool: (- revenue-pool share-amount)
+      }))
+    
+    (ok share-amount)
+  )
+)
+
+(define-public (update-coauthor-permissions (textbook-id uint) (coauthor principal) (can-publish bool))
+  (let
+    (
+      (textbook-data (unwrap! (map-get? textbooks textbook-id) ERR-NOT-FOUND))
+      (coauthor-data (unwrap! (map-get? textbook-coauthors {textbook-id: textbook-id, coauthor: coauthor}) ERR-NOT-COAUTHOR))
+    )
+    (asserts! (is-eq (get author textbook-data) tx-sender) ERR-NOT-AUTHORIZED)
+    
+    (map-set textbook-coauthors {textbook-id: textbook-id, coauthor: coauthor}
+      (merge coauthor-data {can-publish-updates: can-publish}))
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-coauthor (textbook-id uint) (coauthor principal))
+  (let
+    (
+      (textbook-data (unwrap! (map-get? textbooks textbook-id) ERR-NOT-FOUND))
+      (coauthor-data (unwrap! (map-get? textbook-coauthors {textbook-id: textbook-id, coauthor: coauthor}) ERR-NOT-COAUTHOR))
+      (collab-info (unwrap! (map-get? textbook-collaboration-info textbook-id) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq (get author textbook-data) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq coauthor (get author textbook-data))) ERR-CANNOT-REMOVE-LEAD)
+    
+    (map-delete textbook-coauthors {textbook-id: textbook-id, coauthor: coauthor})
+    
+    (map-set textbook-collaboration-info textbook-id
+      (merge collab-info {
+        total-coauthors: (- (get total-coauthors collab-info) u1),
+        collaboration-active: (> (- (get total-coauthors collab-info) u1) u1)
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-coauthor-info (textbook-id uint) (coauthor principal))
+  (map-get? textbook-coauthors {textbook-id: textbook-id, coauthor: coauthor})
+)
+
+(define-read-only (get-collaboration-info (textbook-id uint))
+  (map-get? textbook-collaboration-info textbook-id)
+)
+
+(define-read-only (get-coauthor-invite (textbook-id uint) (invitee principal))
+  (map-get? coauthor-invites {textbook-id: textbook-id, invitee: invitee})
+)
+
+(define-read-only (is-coauthor (textbook-id uint) (user principal))
+  (is-some (map-get? textbook-coauthors {textbook-id: textbook-id, coauthor: user}))
 )
