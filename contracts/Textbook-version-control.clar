@@ -18,6 +18,8 @@
 (define-constant ERR-INVALID-PERCENTAGE (err u1010))
 (define-constant ERR-ALREADY-COAUTHOR (err u1011))
 (define-constant ERR-CANNOT-REMOVE-LEAD (err u1012))
+(define-constant ERR-ALREADY-BOOKMARKED (err u1013))
+(define-constant ERR-NOT-BOOKMARKED (err u1014))
 
 (define-data-var next-textbook-id uint u1)
 (define-data-var subscription-price uint u1000000)
@@ -84,6 +86,13 @@
   invited-at: uint,
   invited-by: principal
 })
+
+(define-map user-bookmarks {user: principal, textbook-id: uint} {
+  bookmarked-at: uint,
+  notes: (string-ascii 500)
+})
+
+(define-map textbook-bookmark-counts uint uint)
 
 (define-public (create-textbook (title (string-ascii 256)) (description (string-ascii 512)) (initial-content-hash (string-ascii 64)) (price uint))
   (let 
@@ -579,4 +588,63 @@
 
 (define-read-only (is-coauthor (textbook-id uint) (user principal))
   (is-some (map-get? textbook-coauthors {textbook-id: textbook-id, coauthor: user}))
+)
+
+(define-public (bookmark-textbook (textbook-id uint) (notes (string-ascii 500)))
+  (let
+    (
+      (existing-bookmark (map-get? user-bookmarks {user: tx-sender, textbook-id: textbook-id}))
+      (textbook-data (unwrap! (map-get? textbooks textbook-id) ERR-NOT-FOUND))
+      (current-count (default-to u0 (map-get? textbook-bookmark-counts textbook-id)))
+    )
+    (asserts! (get active textbook-data) ERR-NOT-FOUND)
+    (asserts! (is-none existing-bookmark) ERR-ALREADY-BOOKMARKED)
+    
+    (map-set user-bookmarks {user: tx-sender, textbook-id: textbook-id} {
+      bookmarked-at: stacks-block-height,
+      notes: notes
+    })
+    
+    (map-set textbook-bookmark-counts textbook-id (+ current-count u1))
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-bookmark (textbook-id uint))
+  (let
+    (
+      (bookmark (unwrap! (map-get? user-bookmarks {user: tx-sender, textbook-id: textbook-id}) ERR-NOT-BOOKMARKED))
+      (current-count (default-to u0 (map-get? textbook-bookmark-counts textbook-id)))
+    )
+    (map-delete user-bookmarks {user: tx-sender, textbook-id: textbook-id})
+    
+    (map-set textbook-bookmark-counts textbook-id (- current-count u1))
+    
+    (ok true)
+  )
+)
+
+(define-public (update-bookmark-notes (textbook-id uint) (notes (string-ascii 500)))
+  (let
+    (
+      (bookmark (unwrap! (map-get? user-bookmarks {user: tx-sender, textbook-id: textbook-id}) ERR-NOT-BOOKMARKED))
+    )
+    (map-set user-bookmarks {user: tx-sender, textbook-id: textbook-id}
+      (merge bookmark {notes: notes}))
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-user-bookmark (user principal) (textbook-id uint))
+  (map-get? user-bookmarks {user: user, textbook-id: textbook-id})
+)
+
+(define-read-only (is-bookmarked (user principal) (textbook-id uint))
+  (is-some (map-get? user-bookmarks {user: user, textbook-id: textbook-id}))
+)
+
+(define-read-only (get-bookmark-count (textbook-id uint))
+  (default-to u0 (map-get? textbook-bookmark-counts textbook-id))
 )
